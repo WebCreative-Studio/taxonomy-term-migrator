@@ -1,0 +1,131 @@
+name: Release plugin
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.0.1. Leave empty to use plugin header version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_SLUG: taxonomy-term-migrator
+  PLUGIN_MAIN_FILE: taxonomy-term-migrator.php
+  UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+  UPDATE_SERVER_USER: ${{ secrets.UPDATE_SERVER_USER }}
+  UPDATE_SERVER_PATH: ${{ secrets.UPDATE_SERVER_PATH }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        run: |
+          PLUGIN_VERSION=$(grep -E '^\s*\* Version:' "$PLUGIN_MAIN_FILE" | sed -E 's/.*Version:\s*//')
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -n "$INPUT_VERSION" ]; then
+            RELEASE_VERSION="$INPUT_VERSION"
+          else
+            RELEASE_VERSION="$PLUGIN_VERSION"
+          fi
+
+          if [ "$PLUGIN_VERSION" != "$RELEASE_VERSION" ]; then
+            echo "Plugin version $PLUGIN_VERSION does not match release version $RELEASE_VERSION"
+            exit 1
+          fi
+
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build ZIP
+        run: |
+          mkdir -p dist "$PLUGIN_SLUG"
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='dist' \
+            --exclude='node_modules' \
+            --exclude='vendor' \
+            --exclude='*.zip' \
+            ./ "$PLUGIN_SLUG/"
+          zip -r "dist/$PLUGIN_SLUG.zip" "$PLUGIN_SLUG"
+
+      - name: Create metadata
+        run: |
+          DOWNLOAD_BASE="${{ secrets.UPDATE_SERVER_PUBLIC_BASE_URL }}"
+          if [ -z "$DOWNLOAD_BASE" ]; then
+            DOWNLOAD_BASE="https://web-creative.studio/wcs-plugins-update"
+          fi
+
+          cat > dist/metadata.json <<JSON
+          {
+            "slug": "$PLUGIN_SLUG",
+            "name": "Taxonomy Term Migrator for WooCommerce",
+            "version": "${{ steps.version.outputs.version }}",
+            "download_url": "$DOWNLOAD_BASE/$PLUGIN_SLUG/$PLUGIN_SLUG.zip",
+            "requires": "6.0",
+            "tested": "6.5",
+            "requires_php": "7.4",
+            "homepage": "https://web-creative.studio/",
+            "author": "WebCreative Studio",
+            "description": "Безопасный перенос терминов и связей товаров между таксономиями WooCommerce.",
+            "changelog": "Release ${{ steps.version.outputs.tag }}"
+          }
+          JSON
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            gh release upload "${{ steps.version.outputs.tag }}" \
+              "dist/$PLUGIN_SLUG.zip" \
+              "dist/metadata.json" \
+              --clobber
+          else
+            gh release create "${{ steps.version.outputs.tag }}" \
+              "dist/$PLUGIN_SLUG.zip" \
+              "dist/metadata.json" \
+              --target "$GITHUB_SHA" \
+              --title "${{ steps.version.outputs.tag }}" \
+              --notes "Release ${{ steps.version.outputs.tag }}"
+          fi
+
+      - name: Install password SSH tools
+        if: ${{ env.UPDATE_SERVER_HOST != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Configure known hosts
+        if: ${{ env.UPDATE_SERVER_HOST != '' }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$UPDATE_SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy to update server
+        if: ${{ env.UPDATE_SERVER_HOST != '' }}
+        env:
+          SSHPASS: ${{ secrets.UPDATE_SERVER_PASSWORD }}
+        run: |
+          REMOTE_BASE="${UPDATE_SERVER_PATH:-.}"
+          REMOTE_DIR="$REMOTE_BASE/$PLUGIN_SLUG"
+          sshpass -e ssh -o StrictHostKeyChecking=yes "$UPDATE_SERVER_USER@$UPDATE_SERVER_HOST" "mkdir -p '$REMOTE_DIR'"
+          sshpass -e scp -o StrictHostKeyChecking=yes "dist/$PLUGIN_SLUG.zip" "$UPDATE_SERVER_USER@$UPDATE_SERVER_HOST:$REMOTE_DIR/$PLUGIN_SLUG.zip"
+          sshpass -e scp -o StrictHostKeyChecking=yes "dist/metadata.json" "$UPDATE_SERVER_USER@$UPDATE_SERVER_HOST:$REMOTE_DIR/metadata.json"
